@@ -4,28 +4,29 @@
 涨停复盘底稿生成脚本
 
 收盘后拉取涨停池、市场情绪、板块榜数据，整理成一份 Markdown 复盘底稿，
-方便直接复制到博客里再加工。数据全部复用项目内的 AkshareFetcher，
-不依赖付费数据源。
+方便直接复制到博客里再加工。数据源通过项目的 DataFetcherManager 获取，
+享受多数据源自动 fallback 能力（akshare -> efinance -> tushare -> ...）。
 
 输出内容：
     1. 市场情绪仪表盘（涨停/跌停/炸板率/成交额 等）
-    2. 涨停梯队（按连板数从高到低分组）
+    2. 涨停梯队（按连板数从高到低分组，全量涨停池）
     3. 题材分布（按所属行业聚合涨停家数）
     4. 主线板块榜（行业涨跌幅 Top/Bottom）
     5. 今日之最（最高封板资金 / 最高连板 / 最高换手）
 
 使用方法：
-    python scripts/limit_up_review.py                 # 复盘当天（默认全量涨停池）
+    python scripts/limit_up_review.py                  # 复盘当天
     python scripts/limit_up_review.py --date 20260609  # 复盘指定日期
-    python scripts/limit_up_review.py --out review.md   # 同时写入文件
-    python scripts/limit_up_review.py --send            # 生成后推送到报告通知渠道
-    python scripts/limit_up_review.py --top 30          # 仅取涨停池前 30 只（博客精简版）
+    python scripts/limit_up_review.py --out review.md  # 同时写入文件
+    python scripts/limit_up_review.py --send           # 生成后推送到报告通知渠道
 
 说明：
     - 涨停池、炸板池数据为收盘后口径，盘中运行结果会不准。
-    - 默认 --top 0 表示拉取当日涨停池全量；正整数则只保留前 N 只。
-    - 涨跌停家数优先取自东财涨跌停池（与梯队明细同源），不再用全市场行情推算。
+    - 默认拉取当日全量涨停池，不做精简截断。
+    - 涨停家数直接从涨停池明细中统计，与梯队明细同源。
     - 炸板率 = 炸板数 / (涨停家数 + 炸板数)，分母与涨停池口径一致。
+    - 跌停池、炸板池直接调用 akshare 接口（含重试 + 多版本接口名兼容），
+      因为项目 DataFetcherManager 不暴露这两个接口。
 """
 
 import argparse
@@ -39,7 +40,7 @@ from typing import Any, Dict, List, Optional
 # 添加项目根目录到路径，复用项目内的数据源适配
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from data_provider.akshare_fetcher import AkshareFetcher
+from data_provider.base import DataFetcherManager
 
 
 def _fmt_amount(value: Optional[float]) -> str:
@@ -62,19 +63,17 @@ def _fmt_seal(value: Optional[float]) -> str:
         return "-"
 
 
-def apply_limit_pool_counts(
+def apply_negative_board_counts(
     stats: Dict[str, Any],
-    pool_counts: Optional[Dict[str, int]],
+    counts: Optional[Dict[str, int]],
 ) -> Optional[int]:
-    """用东财涨跌停池覆盖推算值，并返回炸板数。"""
-    if not pool_counts:
+    """用东财跌停池/炸板池覆盖统计值，并返回炸板数。"""
+    if not counts:
         return None
 
-    if pool_counts.get("limit_up_count") is not None:
-        stats["limit_up_count"] = pool_counts["limit_up_count"]
-    if pool_counts.get("limit_down_count") is not None:
-        stats["limit_down_count"] = pool_counts["limit_down_count"]
-    return pool_counts.get("break_count")
+    if counts.get("limit_down_count") is not None:
+        stats["limit_down_count"] = counts["limit_down_count"]
+    return counts.get("break_count")
 
 
 def _fetch_pool_count_with_retry(
@@ -109,16 +108,19 @@ def _fetch_pool_count_with_retry(
     return None
 
 
-def fetch_limit_pool_counts(date: str) -> Optional[Dict[str, int]]:
-    """自包含获取东财涨停/跌停/炸板池统计，不依赖项目源码改动。"""
+def fetch_negative_board_counts(date: str) -> Optional[Dict[str, int]]:
+    """获取东财跌停池和炸板池统计，返回 {limit_down_count, break_count}。
+
+    涨停家数不在此处获取，而是直接从涨停池明细中统计（避免重复调 API）。
+    """
     try:
         import akshare as ak
     except Exception as exc:
-        print(f"[警告] akshare 导入失败，无法获取涨跌停池统计: {exc}", file=sys.stderr)
+        print(f"[警告] akshare 导入失败，无法获取跌停/炸板池统计: {exc}", file=sys.stderr)
         return None
 
+    # 只拉跌停池和炸板池，涨停家数从涨停池明细统计
     api_groups = {
-        "limit_up_count": ("涨停池", ["stock_zt_pool_em"]),
         "limit_down_count": (
             "跌停池",
             [
@@ -139,20 +141,18 @@ def fetch_limit_pool_counts(date: str) -> Optional[Dict[str, int]]:
     return counts or None
 
 
-# 全量拉取时传给 get_limit_up_pool 的上限（正常交易日远低于此值）
+# 全量拉取时传给 get_limit_up_pool 的上限（正常交易日涨停家数远低于此值）
 _FULL_POOL_FETCH_LIMIT = 10000
 
 
 def fetch_limit_up_pool(
-    fetcher: AkshareFetcher,
+    manager: DataFetcherManager,
     date: str,
-    top: int,
 ) -> Optional[List[Dict[str, Any]]]:
-    """拉取涨停池；top<=0 为全量，正整数为前 N 只。"""
-    pool_n = _FULL_POOL_FETCH_LIMIT if top <= 0 else top
+    """拉取当日全量涨停池，享受 DataFetcherManager 的多源 fallback。"""
     for attempt in range(1, 4):
-        pool = fetcher.get_limit_up_pool(date=date, n=pool_n)
-        if pool is not None:
+        pool = manager.get_limit_up_pool(date=date, n=_FULL_POOL_FETCH_LIMIT)
+        if pool:
             return pool
         if attempt < 3:
             print(f"[警告] 涨停池明细第 {attempt}/3 次为空，20 秒后重试...", file=sys.stderr)
@@ -214,7 +214,6 @@ def build_sentiment_section(
 
 def build_ladder_section(
     pool: Optional[List[Dict[str, Any]]],
-    top: int,
 ) -> str:
     """涨停梯队，按连板数从高到低分组。"""
     lines = ["## 二、涨停梯队（按连板数）", ""]
@@ -223,8 +222,7 @@ def build_ladder_section(
         lines.append("")
         return "\n".join(lines)
 
-    scope = "全量涨停池" if top <= 0 else f"前 {top} 只"
-    lines.append(f"> 以下共 **{len(pool)}** 只（{scope}）。")
+    lines.append(f"> 以下共 **{len(pool)}** 只（全量涨停池）。")
     lines.append("")
 
     # 按连板数分组
@@ -341,29 +339,27 @@ def build_highlights_section(pool: Optional[List[Dict[str, Any]]]) -> str:
     return "\n".join(lines)
 
 
-def generate_review(date: str, top: int) -> str:
+def generate_review(date: str) -> str:
     """生成完整复盘底稿 Markdown。"""
-    fetcher = AkshareFetcher()
+    manager = DataFetcherManager()
 
     print("[1/5] 获取市场涨跌统计...", file=sys.stderr)
-    stats = fetcher.get_market_stats() or {}
+    stats = manager.get_market_stats(purpose="limit_up_review") or {}
 
-    print("[2/5] 获取东财涨跌停池统计...", file=sys.stderr)
-    pool_counts = fetch_limit_pool_counts(date=date)
-    break_count = apply_limit_pool_counts(stats, pool_counts)
+    print("[2/5] 获取跌停池与炸板池统计...", file=sys.stderr)
+    negative_counts = fetch_negative_board_counts(date=date)
+    break_count = apply_negative_board_counts(stats, negative_counts)
 
-    pool_label = "全量" if top <= 0 else f"前 {top} 只"
-    print(f"[3/5] 获取涨停池明细（{pool_label}）...", file=sys.stderr)
-    pool = fetch_limit_up_pool(fetcher, date=date, top=top)
-    if pool and top <= 0 and stats.get("limit_up_count") != len(pool):
-        print(
-            f"[提示] 涨停家数改用涨停池明细数量: {stats.get('limit_up_count')} -> {len(pool)}",
-            file=sys.stderr,
-        )
+    print("[3/5] 获取涨停池明细（全量）...", file=sys.stderr)
+    pool = fetch_limit_up_pool(manager, date=date)
+    if pool:
         stats["limit_up_count"] = len(pool)
+        print(f"     涨停池共 {len(pool)} 只", file=sys.stderr)
+    else:
+        print("[警告] 涨停池为空，涨停梯队和题材分布将跳过", file=sys.stderr)
 
     print("[4/5] 获取板块涨跌榜...", file=sys.stderr)
-    rankings = fetcher.get_sector_rankings(n=5)
+    rankings = manager.get_sector_rankings(n=5)
 
     if break_count is None:
         print("[5/5] 炸板池未取到，炸板率将显示 N/A", file=sys.stderr)
@@ -378,7 +374,7 @@ def generate_review(date: str, top: int) -> str:
         "> 本文由 daily_stock_analysis 数据脚本自动生成，仅为复盘原始素材，请自行核对与加工。",
         "",
         build_sentiment_section(stats, break_count),
-        build_ladder_section(pool, top),
+        build_ladder_section(pool),
         build_theme_section(pool),
         build_sector_section(rankings),
         build_highlights_section(pool),
@@ -426,12 +422,6 @@ def main() -> int:
         help="复盘日期，格式 YYYYMMDD，默认今天",
     )
     parser.add_argument(
-        "--top",
-        type=int,
-        default=0,
-        help="涨停池条数：0=全量（默认），正整数=仅取前 N 只",
-    )
-    parser.add_argument(
         "--out",
         default=None,
         help="输出文件路径，不指定则只打印到标准输出",
@@ -449,7 +439,7 @@ def main() -> int:
         print(f"[错误] 日期格式应为 YYYYMMDD，收到：{args.date}", file=sys.stderr)
         return 1
 
-    markdown = generate_review(args.date, args.top)
+    markdown = generate_review(args.date)
 
     if args.out:
         out_path = Path(args.out)
