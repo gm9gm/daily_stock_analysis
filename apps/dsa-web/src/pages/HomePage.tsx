@@ -1,7 +1,7 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BarChart3, Check, SlidersHorizontal } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { getParsedApiError, type ParsedApiError } from '../api/error';
 import { analysisApi } from '../api/analysis';
 import { historyApi } from '../api/history';
@@ -34,8 +34,16 @@ type RunFlowDrawerState =
   | { open: false }
   | { open: true; source: RunFlowSnapshotSource; title: string };
 
+type StockAnalysisNavigationState = {
+  stockCode?: string;
+  stockName?: string;
+  autoAnalyze?: boolean;
+  selectionSource?: string;
+};
+
 const HomePage: React.FC = () => {
   const navigate = useNavigate();
+  const location = useLocation();
   const { language: uiLanguage, t } = useUiLanguage();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isSubmittingMarketReview, setIsSubmittingMarketReview] = useState(false);
@@ -379,6 +387,20 @@ const HomePage: React.FC = () => {
     },
     [query, selectedAnalysisSkills, submitAnalysis],
   );
+
+  useEffect(() => {
+    const state = location.state as StockAnalysisNavigationState | null;
+    const stockCode = typeof state?.stockCode === 'string' ? state.stockCode.trim() : '';
+    if (!stockCode) {
+      return;
+    }
+    const stockName = typeof state?.stockName === 'string' ? state.stockName.trim() : '';
+    setQuery(stockCode);
+    navigate(location.pathname, { replace: true, state: null });
+    if (state?.autoAnalyze) {
+      handleSubmitAnalysis(stockCode, stockName || undefined, 'import');
+    }
+  }, [handleSubmitAnalysis, location.pathname, location.state, navigate, setQuery]);
 
   const handleAskFollowUp = useCallback(() => {
     if (selectedReport?.meta.id === undefined || selectedReport.meta.reportType === 'market_review') {

@@ -157,6 +157,41 @@ class TestAlphaSiftFieldsRegistered(unittest.TestCase):
         self.assertEqual(field["ui_control"], "password")
 
 
+class TestLLMUsageHMACFieldsRegistered(unittest.TestCase):
+    def test_secret_is_sensitive_password_field(self):
+        field = get_field_definition("LLM_USAGE_HMAC_SECRET")
+
+        self.assertEqual(field["category"], "ai_model")
+        self.assertTrue(field["is_sensitive"])
+        self.assertEqual(field["ui_control"], "password")
+        self.assertEqual(field["help_key"], "settings.ai_model.LLM_USAGE_HMAC_SECRET")
+        self.assertIn("high-entropy", field["description"])
+        self.assertIn("version control", field["description"])
+        self.assertIn("openssl rand -hex 32", field["examples"][0])
+        self.assertIn("secret_value", field.get("warning_codes", []))
+
+    def test_key_version_is_visible_non_sensitive_field(self):
+        field = get_field_definition("LLM_USAGE_HMAC_KEY_VERSION")
+
+        self.assertEqual(field["category"], "ai_model")
+        self.assertFalse(field["is_sensitive"])
+        self.assertEqual(field["ui_control"], "text")
+        self.assertEqual(field["default_value"], "local-v1")
+        self.assertEqual(field["help_key"], "settings.ai_model.LLM_USAGE_HMAC_KEY_VERSION")
+
+
+class TestScheduleTimesFieldRegistered(unittest.TestCase):
+    def test_schedule_times_pattern_accepts_documented_empty_fallback(self):
+        field = get_field_definition("SCHEDULE_TIMES")
+        pattern = re.compile(field["validation"]["pattern"])
+
+        self.assertIsNotNone(pattern.fullmatch(""))
+        self.assertIsNotNone(pattern.fullmatch("   "))
+        self.assertIsNotNone(pattern.fullmatch("09:20,12:30,15:10"))
+        self.assertIsNone(pattern.fullmatch("09:20,"))
+        self.assertIsNone(pattern.fullmatch("25:70"))
+
+
 class TestSettingsHelpMetadata(unittest.TestCase):
     """Field help metadata should be available for covered settings help slices."""
 

@@ -222,6 +222,10 @@ P5 强化聚合报告通知路径的失败边界：`_send_notifications()` 在 r
 - 任一静态渠道发送成功时，P4 降噪 reservation 会写入正式记录；全部静态渠道失败或抛异常时，会释放 reservation。
 - `send_to_context()` 仍独立于静态渠道 route 和降噪记录，用于回复触发任务的 Bot 会话上下文。
 
+#1390 P6 的决策信号摘要沿用同一失败隔离边界：分析报告通知和告警通知只追加低敏 `decision_signal_summary` 摘要（动作、周期、理由、观察条件、风险和来源报告），不会输出 signal `metadata`、`evidence`、raw diagnostics 或 webhook/token。告警通知发送失败只记录通知尝试或 dispatch fallback，不回滚已经写入的 trigger 或 DecisionSignal。
+
+DecisionSignal 通知摘要字段、敏感信息边界、迁移与回滚说明见 [DecisionSignal 决策信号专题](decision-signals.md)。
+
 ## 通知降噪机制
 
 P4 新增进程内降噪，只影响静态配置渠道，不影响 `send_to_context()` 的机器人触发会话回执。默认所有配置关闭，未设置时保持旧行为。

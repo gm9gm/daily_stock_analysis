@@ -25,6 +25,8 @@ from src.search_service import SearchService
 from src.core.market_profile import get_profile, MarketProfile
 from src.core.market_strategy import get_market_strategy_blueprint
 from src.schemas.market_light import MarketLightSnapshot
+from src.services.run_diagnostics import record_llm_run, record_llm_run_started
+from src.services.intelligence_service import IntelligenceService
 from data_provider.base import DataFetcherManager
 
 logger = logging.getLogger(__name__)
@@ -547,7 +549,35 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         logger.info("[大盘] %s action=generate_review status=start", self._log_context())
         # Use the public generate_text() entry point - never access private analyzer attributes.
-        review = self.analyzer.generate_text(prompt, max_tokens=8192, temperature=0.7)
+        llm_started_at = time.perf_counter()
+        try:
+            record_llm_run_started(
+                provider="litellm",
+                model=getattr(self.config, "litellm_model", None),
+                call_type="market_review",
+            )
+            review = self.analyzer.generate_text(prompt, max_tokens=8192, temperature=0.7)
+        except Exception as exc:
+            record_llm_run(
+                success=False,
+                provider="litellm",
+                model=getattr(self.config, "litellm_model", None),
+                call_type="market_review",
+                duration_ms=int((time.perf_counter() - llm_started_at) * 1000),
+                error_type=type(exc).__name__,
+                error_message=exc,
+            )
+            raise
+
+        record_llm_run(
+            success=bool(review),
+            provider="litellm",
+            model=getattr(self.config, "litellm_model", None),
+            call_type="market_review",
+            duration_ms=int((time.perf_counter() - llm_started_at) * 1000),
+            error_type=None if review else "EmptyResponse",
+            error_message=None if review else "empty market review response",
+        )
 
         if review:
             logger.info(
@@ -1425,6 +1455,7 @@ Market conditions can change quickly. The data above is for reference only and d
 
         # 2. 搜索市场新闻
         news = self.search_market_news()
+        news = self._merge_persisted_market_intelligence(news)
 
         # 3. 生成复盘报告
         report = self.generate_market_review(overview, news)
@@ -1444,6 +1475,52 @@ Market conditions can change quickly. The data above is for reference only and d
             market_light_snapshot=snapshot,
             structured_payload=structured_payload,
         )
+
+    def _merge_persisted_market_intelligence(self, news: List) -> List:
+        """Merge local persisted market intelligence and search news with bounded prompt/payload slot preservation."""
+        search_news = list(news or [])
+        merged_local = []
+        seen_urls = {
+            self._get_news_field(item, "url")
+            for item in search_news
+            if self._get_news_field(item, "url")
+        }
+        try:
+            service = IntelligenceService()
+            payload = service.list_items(
+                scope_type="market",
+                market=self.region,
+                published_days=max(1, int(self.config.get_effective_news_window_days() or 1)),
+                page=1,
+                page_size=6,
+            )
+            for item in payload.get("items", []):
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "")
+                if url and url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                merged_local.append({
+                    "title": item.get("title") or "未命名资讯",
+                    "snippet": item.get("summary") or "",
+                    "source": item.get("source") or item.get("source_name") or "local-intel",
+                    "published_date": item.get("published_at") or "",
+                    "url": "" if url.startswith("no-url:intel:") else url,
+                })
+        except Exception as exc:
+            logger.debug("[大盘] %s action=load_local_intelligence status=failed error=%s", self._log_context(), exc)
+        merged_news = []
+        merged_local_index = 0
+        merged_search_index = 0
+        while merged_local_index < len(merged_local) or merged_search_index < len(search_news):
+            if merged_local_index < len(merged_local):
+                merged_news.append(merged_local[merged_local_index])
+                merged_local_index += 1
+            if merged_search_index < len(search_news):
+                merged_news.append(search_news[merged_search_index])
+                merged_search_index += 1
+        return merged_news
 
     def run_daily_review(self) -> str:
         """

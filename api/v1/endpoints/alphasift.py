@@ -87,18 +87,32 @@ def alphasift_hotspots(
     provider: str = Query("", max_length=32),
     top: int = Query(12, ge=1, le=50),
     refresh: bool = Query(False),
+    include_details: bool = Query(False),
     config: Config = Depends(get_config_dep),
 ) -> Dict[str, Any]:
-    return _service(config).hotspots(provider=provider, top=top, refresh=refresh)
+    refresh_value = refresh if isinstance(refresh, bool) else bool(getattr(refresh, "default", False))
+    include_details_value = (
+        include_details
+        if isinstance(include_details, bool)
+        else bool(getattr(include_details, "default", False))
+    )
+    return _service(config).hotspots(
+        provider=provider,
+        top=top,
+        refresh=refresh_value,
+        include_details=include_details_value,
+    )
 
 
 @router.get("/hotspots/{topic:path}")
 def alphasift_hotspot_detail(
     topic: str,
     provider: str = Query("", max_length=32),
+    refresh: bool = Query(False),
     config: Config = Depends(get_config_dep),
 ) -> Dict[str, Any]:
-    return _service(config).hotspot_detail(topic=topic, provider=provider)
+    refresh_value = refresh if isinstance(refresh, bool) else bool(getattr(refresh, "default", False))
+    return _service(config).hotspot_detail(topic=topic, provider=provider, refresh=refresh_value)
 
 
 @router.post("/install")

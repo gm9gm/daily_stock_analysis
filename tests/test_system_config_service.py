@@ -58,7 +58,7 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         message = SimpleNamespace(content=content, tool_calls=tool_calls or [])
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
-    def test_get_config_returns_raw_sensitive_values(self) -> None:
+    def test_get_config_keeps_regular_sensitive_values_unmasked(self) -> None:
         payload = self.service.get_config(include_schema=True)
         items = {item["key"]: item for item in payload["items"]}
 
@@ -79,6 +79,22 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertEqual(items["ALPHASIFT_INSTALL_SPEC"]["value"], payload["mask_token"])
         self.assertTrue(items["ALPHASIFT_INSTALL_SPEC"]["is_masked"])
         self.assertTrue(items["ALPHASIFT_INSTALL_SPEC"]["schema"]["is_sensitive"])
+
+    def test_get_config_masks_llm_usage_hmac_secret(self) -> None:
+        self._rewrite_env(
+            "STOCK_LIST=600519,000001",
+            "LLM_USAGE_HMAC_SECRET=telemetry-secret",
+            "LLM_USAGE_HMAC_KEY_VERSION=test-v1",
+        )
+
+        payload = self.service.get_config(include_schema=True)
+        items = {item["key"]: item for item in payload["items"]}
+
+        self.assertEqual(items["LLM_USAGE_HMAC_SECRET"]["value"], payload["mask_token"])
+        self.assertTrue(items["LLM_USAGE_HMAC_SECRET"]["is_masked"])
+        self.assertTrue(items["LLM_USAGE_HMAC_SECRET"]["schema"]["is_sensitive"])
+        self.assertEqual(items["LLM_USAGE_HMAC_KEY_VERSION"]["value"], "test-v1")
+        self.assertFalse(items["LLM_USAGE_HMAC_KEY_VERSION"]["is_masked"])
 
     def test_get_config_uses_switch_default_for_missing_report_model_toggle(self) -> None:
         payload = self.service.get_config(include_schema=True)
@@ -732,7 +748,9 @@ class SystemConfigServiceTestCase(unittest.TestCase):
             "LLM_OPENAI_MODELS=openai/gpt-4o-mini,openai/gpt-4o",
             "LITELLM_FALLBACK_MODELS=openai/gpt-4o-mini,openai/gpt-4o",
             "ALPHASIFT_ENABLED=false",
-            "ALPHASIFT_INSTALL_SPEC=git+https://github.com/ZhuLinsen/alphasift.git@d038c52c468543726fc1fd830b53c27d3f09d6da",
+            "ALPHASIFT_INSTALL_SPEC=git+https://github.com/ZhuLinsen/alphasift.git@377049857cc04175dc3cca62121ee41adec6cdb8",
+            "LLM_USAGE_HMAC_SECRET=telemetry-secret",
+            "LLM_USAGE_HMAC_KEY_VERSION=test-v1",
             "GEMINI_API_KEY=legacy-secret",
         )
 
@@ -741,6 +759,7 @@ class SystemConfigServiceTestCase(unittest.TestCase):
             items=[
                 {"key": "ALPHASIFT_ENABLED", "value": "true"},
                 {"key": "ALPHASIFT_INSTALL_SPEC", "value": "******"},
+                {"key": "LLM_USAGE_HMAC_SECRET", "value": "******"},
                 {"key": "GEMINI_API_KEY", "value": "******"},
             ],
             mask_token="******",
@@ -750,14 +769,16 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertTrue(response["success"])
         self.assertEqual(response["applied_count"], 1)
         self.assertIn("ALPHASIFT_ENABLED", response["updated_keys"])
-        self.assertEqual(response["skipped_masked_count"], 2)
+        self.assertEqual(response["skipped_masked_count"], 3)
 
         current_map = self.manager.read_config_map()
         self.assertEqual(current_map["ALPHASIFT_ENABLED"], "true")
         self.assertEqual(
             current_map["ALPHASIFT_INSTALL_SPEC"],
-            "git+https://github.com/ZhuLinsen/alphasift.git@d038c52c468543726fc1fd830b53c27d3f09d6da",
+            "git+https://github.com/ZhuLinsen/alphasift.git@377049857cc04175dc3cca62121ee41adec6cdb8",
         )
+        self.assertEqual(current_map["LLM_USAGE_HMAC_SECRET"], "telemetry-secret")
+        self.assertEqual(current_map["LLM_USAGE_HMAC_KEY_VERSION"], "test-v1")
         self.assertEqual(current_map["GEMINI_API_KEY"], "legacy-secret")
         self.assertEqual(current_map["LITELLM_MODEL"], "openai/gpt-4o-mini")
         self.assertEqual(current_map["AGENT_LITELLM_MODEL"], "openai/gpt-4o")
@@ -773,6 +794,11 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         validation = self.service.validate(items=[{"key": "SCHEDULE_TIME", "value": "25:70"}])
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["code"] == "invalid_format" for issue in validation["issues"]))
+
+    def test_validate_accepts_empty_schedule_times_fallback(self) -> None:
+        validation = self.service.validate(items=[{"key": "SCHEDULE_TIMES", "value": ""}])
+        self.assertTrue(validation["valid"])
+        self.assertEqual(validation["issues"], [])
 
     def test_validate_reports_invalid_searxng_url(self) -> None:
         validation = self.service.validate(items=[{"key": "SEARXNG_BASE_URLS", "value": "searx.local,https://ok.example"}])
@@ -2644,13 +2670,20 @@ class SystemConfigServiceTestCase(unittest.TestCase):
             for warning in response["warnings"]
             if "SCHEDULE_ENABLED" in warning
         )
+        schedule_run_warning = next(
+            warning
+            for warning in response["warnings"]
+            if "SCHEDULE_RUN_IMMEDIATELY" in warning
+        )
 
         self.assertIn("非 schedule 模式", run_warning)
         self.assertNotIn("以 schedule 模式", run_warning)
-        self.assertIn("SCHEDULE_RUN_IMMEDIATELY", schedule_warning)
-        self.assertIn("不会因为本次保存启动、停止或重建 scheduler", schedule_warning)
-        self.assertIn("以 schedule 模式重新启动后生效", schedule_warning)
-        self.assertNotIn("它属于启动期单次运行配置", schedule_warning)
+        self.assertIn("runtime scheduler", schedule_warning)
+        self.assertIn("CLI schedule", schedule_warning)
+        self.assertIn("SCHEDULE_RUN_IMMEDIATELY", schedule_run_warning)
+        self.assertIn("不会因为本次保存启动、停止或重建 scheduler", schedule_run_warning)
+        self.assertIn("以 schedule 模式重新启动后生效", schedule_run_warning)
+        self.assertNotIn("它属于启动期单次运行配置", schedule_run_warning)
 
     def test_update_appends_schedule_time_runtime_rebind_warning(self) -> None:
         response = self.service.update(
