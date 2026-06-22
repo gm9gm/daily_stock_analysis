@@ -46,6 +46,12 @@ COPY requirements.txt .
 # 安装 Python 依赖
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 预创建第三方库运行期需要写入的目录并授权给 non-root 用户
+# efinance 运行时会在自身包目录下创建 data/ 缓存，默认 site-packages 属主为 root，
+# 会触发 "Permission denied: .../efinance/config/../data"，导致数据源整体降级。
+RUN python -c "import efinance, os; os.makedirs(os.path.join(os.path.dirname(efinance.__file__), 'data'), exist_ok=True)" && \
+    chown -R dsa:dsa "$(python -c 'import efinance, os; print(os.path.dirname(efinance.__file__))')"
+
 # 复制应用代码
 COPY *.py ./
 COPY api/ ./api/

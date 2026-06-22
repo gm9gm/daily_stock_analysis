@@ -8,7 +8,6 @@
 #   同时启动: docker-compose -f ./docker/docker-compose.yml up -d analyzer server
 
 name: daily-stock-analysis
-version: '3.8'
 
 x-common: &common
   build:
@@ -45,7 +44,7 @@ x-common: &common
   logging:
     driver: "json-file"
     options:
-      max-size: "10m"
+      max-size: "20m"
       max-file: "3"
   # 资源限制
   deploy:
