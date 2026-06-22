@@ -1065,7 +1065,21 @@ def start_api_server(host: str, port: int, config: Config) -> None:
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
 
-    timeout_seconds = 3.0
+    # 等待 uvicorn 完成启动并标记 started=True 的最长时长。
+    # 上游 v3.22.0 引入的硬编码 3s 超时在 Docker 冷启动 + 多模块初始化
+    # （DecisionSignal、Intelligence 等新表的 schema 迁移、app_lifespan
+    # 后台任务调度）场景下偏短，会让 stock-server 始终 fail-fast 退出后
+    # 被 Docker 反复重启。改为读取 FASTAPI_STARTUP_TIMEOUT_SECONDS，
+    # 默认 30s，仍允许显式调小以保留 fail-fast 行为。
+    try:
+        timeout_seconds = float(os.getenv("FASTAPI_STARTUP_TIMEOUT_SECONDS", "30"))
+    except ValueError:
+        logger.warning(
+            "FASTAPI_STARTUP_TIMEOUT_SECONDS 配置非法（无法解析为 float），回退默认 30s"
+        )
+        timeout_seconds = 30.0
+    if timeout_seconds <= 0:
+        timeout_seconds = 30.0
     wait_deadline = time.time() + timeout_seconds
     while time.time() < wait_deadline:
         if startup_error:
